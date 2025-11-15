@@ -1,0 +1,773 @@
+# Full updated agora_app.py
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import math
+from collections import defaultdict
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import hashlib
+import io
+import wave
+
+import streamlit as st
+
+# ML model imports
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+
+# ----------------------------
+# Page config & Navigation (must be BEFORE page logic)
+# ----------------------------
+st.set_page_config(page_title="Agora BudgetHelp", layout="wide", page_icon="💼")
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to:", ["Home", "Budget Planner", "Analytics Dashboard", "Chat Assistant", "Profile & Settings"])
+
+# ----------------------------
+# SIMPLE AUTH: Sign up / Sign in (file-based, minimal, not production)
+# ----------------------------
+USERS_FILE = "users.csv"
+
+def _hash_password(pw):
+    try:
+        return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+    except Exception:
+        return pw
+
+def load_users():
+    if os.path.exists(USERS_FILE):
+        try:
+            dfu = pd.read_csv(USERS_FILE)
+            return {r["username"]: r["password_hash"] for _, r in dfu.iterrows()}
+        except Exception:
+            return {}
+    return {}
+
+def save_user(username, password_hash):
+    users = load_users()
+    users[username] = password_hash
+    dfu = pd.DataFrame([{"username":u, "password_hash":h} for u,h in users.items()])
+    dfu.to_csv(USERS_FILE, index=False)
+
+# Initialize session user
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+# Render auth controls in sidebar (signup/login)
+with st.sidebar.expander("Account", expanded=True):
+    if st.session_state.user:
+        st.write(f"**Signed in as:** {st.session_state.user}")
+        if st.button("Sign out", key="signout_btn"):
+            st.session_state.user = None
+            st.success("Signed out")
+    else:
+        auth_tab = st.radio("Choose", ["Sign in", "Sign up"], index=0, key="auth_tab")
+        if auth_tab == "Sign up":
+            su_user = st.text_input("Username", key="su_user")
+            su_pw = st.text_input("Password", type="password", key="su_pw")
+            if st.button("Create account", key="create_acc"):
+                if not su_user or not su_pw:
+                    st.warning("Enter username and password")
+                else:
+                    users = load_users()
+                    if su_user in users:
+                        st.error("Username already exists. Choose another.")
+                    else:
+                        save_user(su_user, _hash_password(su_pw))
+                        st.success("Account created. You can sign in now.")
+        else:
+            li_user = st.text_input("Username", key="li_user")
+            li_pw = st.text_input("Password", type="password", key="li_pw")
+            if st.button("Sign in", key="sign_in_btn"):
+                users = load_users()
+                if li_user in users and users[li_user] == _hash_password(li_pw):
+                    st.session_state.user = li_user
+                    st.success(f"Signed in as {li_user}")
+                else:
+                    st.error("Invalid credentials")
+
+# If not signed in, block main pages (show info) except allow Home to view summary
+if not st.session_state.user:
+    try:
+        if page != "Home":
+            st.sidebar.warning("Sign in to access this section.")
+            st.title("Sign in required")
+            st.info("Please sign in from the 'Account' panel in the sidebar to access this app's features.")
+            st.stop()
+    except Exception:
+        pass
+
+# ----------------------------
+# Files / Persistence
+# ----------------------------
+DATA_FILE = "expenses.csv"
+SETTINGS_FILE = "settings.csv"
+
+def load_expenses():
+    if os.path.exists(DATA_FILE):
+        try:
+            return pd.read_csv(DATA_FILE)
+        except:
+            return pd.DataFrame(columns=["amount", "category", "note", "timestamp"])
+    return pd.DataFrame(columns=["amount", "category", "note", "timestamp"])
+
+def save_expenses(df):
+    df.to_csv(DATA_FILE, index=False)
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            return pd.read_csv(SETTINGS_FILE).set_index("key")["value"].to_dict()
+        except:
+            return {}
+    return {}
+
+def save_settings(settings_dict):
+    df = pd.DataFrame([{"key": k, "value": v} for k, v in settings_dict.items()])
+    df.to_csv(SETTINGS_FILE, index=False)
+
+# ----------------------------
+# ML: Expense Category Classifier (prototype)
+# ----------------------------
+training_notes = [
+    "rent payment", "house rent", "room rent",
+    "grocery shopping", "vegetables", "dinner", "lunch", "breakfast",
+    "uber ride", "ola cab", "bus ticket", "petrol",
+    "movie ticket", "concert", "netflix subscription",
+    "electricity bill", "water bill", "phone recharge", "wifi bill",
+    "clothes shopping", "shoes", "mall shopping",
+]
+training_labels = [
+    "Bills", "Bills", "Bills",
+    "Food", "Food", "Food", "Food", "Food",
+    "Transport", "Transport", "Transport", "Transport",
+    "Entertainment", "Entertainment", "Entertainment",
+    "Bills", "Bills", "Bills", "Bills",
+    "Shopping", "Shopping", "Shopping"
+]
+
+vectorizer = TfidfVectorizer()
+try:
+    X_train = vectorizer.fit_transform(training_notes)
+    category_model = LogisticRegression(max_iter=1000)
+    category_model.fit(X_train, training_labels)
+    def predict_expense_category(text):
+        if not isinstance(text, str) or text.strip() == "":
+            return "Other"
+        vec = vectorizer.transform([text])
+        return category_model.predict(vec)[0]
+except Exception:
+    # In case something fails, fallback to keyword mapping
+    def predict_expense_category(text):
+        t = (text or "").lower()
+        if any(k in t for k in ["rent"]):
+            return "Bills"
+        if any(k in t for k in ["grocery","vegetable","dinner","lunch","breakfast","pizza","burger"]):
+            return "Food"
+        if any(k in t for k in ["uber","ola","cab","bus","train","petrol"]):
+            return "Transport"
+        if any(k in t for k in ["netflix","movie","concert"]):
+            return "Entertainment"
+        if any(k in t for k in ["shop","clothes","jeans","tshirt","mall","shoe"]):
+            return "Shopping"
+        return "Other"
+
+# ----------------------------
+# Forecasting helpers (Prophet preferred; fallback to pmdarima/statsmodels or simple)
+# ----------------------------
+def fit_prophet_and_forecast(dates, values, periods=30):
+    try:
+        from prophet import Prophet
+        dfp = pd.DataFrame({"ds": pd.to_datetime(dates), "y": values.astype(float)})
+        m = Prophet(daily_seasonality=True, weekly_seasonality=True)
+        m.fit(dfp)
+        future = m.make_future_dataframe(periods=periods)
+        fcst = m.predict(future)
+        res = fcst.set_index("ds")["yhat"].rename("forecast")
+        return res
+    except Exception as e:
+        raise e
+
+def fit_arima_and_forecast(dates, values, periods=30):
+    import pandas as pd
+    try:
+        from pmdarima import auto_arima
+        from statsmodels.tsa.statespace.sarimax import SARIMAX
+        ts = pd.Series(values.astype(float), index=pd.to_datetime(dates)).asfreq("D").fillna(0)
+        model = auto_arima(ts, seasonal=False, error_action="ignore", suppress_warnings=True)
+        order = model.order
+        sar = SARIMAX(ts, order=order, enforce_stationarity=False, enforce_invertibility=False)
+        res = sar.fit(disp=False)
+        pred = res.get_forecast(steps=periods)
+        idx = pd.date_range(start=ts.index.min(), periods=len(ts)+periods, freq="D")
+        all_preds = pd.concat([ts, pred.predicted_mean])
+        all_preds.index = idx
+        return all_preds.rename("forecast")
+    except Exception:
+        # final fallback: rolling mean projection
+        ts = pd.Series(values.astype(float), index=pd.to_datetime(dates)).asfreq("D").fillna(0)
+        last_mean = ts.tail(7).mean() if len(ts) >= 1 else 0
+        idx = pd.date_range(start=ts.index.min(), periods=len(ts)+periods, freq="D")
+        simple = pd.concat([ts, pd.Series([last_mean]*periods, index=idx[-periods:])])
+        return simple.rename("forecast")
+
+# ----------------------------
+# Session state defaults & load persisted data
+# ----------------------------
+if "income" not in st.session_state:
+    st.session_state.income = 0
+if "budget" not in st.session_state:
+    st.session_state.budget = 0
+if "savings_goal" not in st.session_state:
+    st.session_state.savings_goal = 20
+if "expenses_df" not in st.session_state:
+    st.session_state.expenses_df = load_expenses()
+
+# Load settings if available
+saved_settings = load_settings()
+if saved_settings:
+    try:
+        st.session_state.income = int(saved_settings.get("income", st.session_state.income))
+        st.session_state.budget = int(saved_settings.get("budget", st.session_state.budget))
+        st.session_state.savings_goal = int(saved_settings.get("savings_goal", st.session_state.savings_goal))
+    except:
+        pass
+
+# ----------------------------
+# Advanced Agora AI Engine (multi-turn)
+# ----------------------------
+def _category_summary(expenses_df):
+    if expenses_df is None or expenses_df.empty:
+        return {}, None
+    s = expenses_df.groupby("category")["amount"].sum().to_dict()
+    if not s:
+        return {}, None
+    top = max(s.items(), key=lambda x: x[1])[0]
+    return s, top
+
+def create_detailed_plan(income, budget, savings_goal, category_budgets, expenses_df):
+    actions = []
+    total_spent = int(expenses_df["amount"].sum()) if (expenses_df is not None and not expenses_df.empty) else 0
+    target_save_amt = int((savings_goal / 100) * income) if income else 0
+    current_save = max(0, income - total_spent) if income else 0
+
+    actions.append(f"Current monthly savings (income - spent): ₹{current_save:,}. Target savings: ₹{target_save_amt:,} ({savings_goal}%).")
+    if current_save >= target_save_amt:
+        actions.append("You're on track to meet your savings goal — keep current spending or gradually increase goal.")
+        return actions
+
+    needed = target_save_amt - current_save
+    actions.append(f"You need to free up approximately ₹{needed:,} more per month to meet the target.")
+
+    cat_totals, top_cat = _category_summary(expenses_df)
+    if not cat_totals:
+        actions.append("No expense history to make detailed category suggestions. Add expenses first.")
+        return actions
+
+    sorted_cats = sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
+    remaining_needed = needed
+    for cat, amt in sorted_cats:
+        if remaining_needed <= 0:
+            break
+        reduce_pct = 0.10
+        reduce_amt = int(amt * reduce_pct)
+        if reduce_amt < remaining_needed and reduce_amt < 500:
+            reduce_pct = 0.20
+            reduce_amt = int(amt * reduce_pct)
+        reduce_amt = min(reduce_amt, remaining_needed)
+        if reduce_amt <= 0:
+            continue
+        actions.append(f"Reduce {cat} by about {int(reduce_pct*100)}% to save roughly ₹{reduce_amt:,} (current {cat}: ₹{amt:,}).")
+        remaining_needed -= reduce_amt
+
+    if remaining_needed > 0:
+        actions.append("If reductions above are insufficient, consider cutting flexible 'Wants' (entertainment, dining) further or temporarily lowering the savings goal by a small percent until you stabilize.")
+    return actions
+
+def agora_ai_engine_advanced(user_msg, expenses_df=None, income=None, budget=None, savings_goal=None, category_budgets=None, session=None):
+    if session is None:
+        session = {}
+
+    text = (user_msg or "").strip()
+    if not text:
+        return "Please enter your question."
+
+    txt = text.lower()
+    cat_totals, top_cat = _category_summary(expenses_df)
+    total_spent = int(expenses_df["amount"].sum()) if (expenses_df is not None and not expenses_df.empty) else 0
+    income_val = int(income) if income else None
+    budget_val = int(budget) if budget else None
+    savings_pct = int(savings_goal) if savings_goal is not None else None
+
+    pending = session.get("agora_pending", None)
+    if pending == "confirm_create_plan":
+        if txt in {"yes", "y", "sure", "create", "please do", "ok", "okay"}:
+            plan_lines = create_detailed_plan(income_val, budget_val, savings_pct, category_budgets or {}, expenses_df)
+            session["agora_pending"] = None
+            return "Here is a detailed plan:\n\n" + "\n".join(plan_lines)
+        else:
+            session["agora_pending"] = None
+            return "Okay, I won't create the plan now. Tell me what you'd like instead."
+
+    if any(k in txt for k in ["save", "savings", "how much to save", "saving goal", "should i save"]):
+        if income_val:
+            target = int((savings_pct / 100) * income_val)
+            # set pending question for confirmation when needed
+            session["agora_pending"] = "confirm_create_plan"
+            return f"To hit your savings goal of {savings_pct}% you should save about ₹{target:,} per month. I can create a plan to free up that amount — do you want me to create it? (yes/no)"
+        return "Tell me your income so I can calculate target savings."
+
+    if any(k in txt for k in ["analyse", "analyze", "review", "analysis"]):
+        if (expenses_df is None) or expenses_df.empty:
+            return "You have no recorded expenses yet. Add some in the Budget Planner and I'll analyze them."
+        res = [f"Total spent so far: ₹{total_spent:,}.", f"Top category: {top_cat or 'N/A'}."]
+        top3 = sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)[:3]
+        if top3:
+            res.append("Top categories: " + ", ".join([f"{c} (₹{int(a):,})" for c,a in top3]))
+        return "\n".join(res)
+
+    if any(k in txt for k in ["overspend", "over budget", "exceed", "exceeded", "exceeding"]):
+        if budget_val and total_spent > budget_val:
+            return f"⚠ You're over budget by ₹{total_spent - budget_val:,}. Highest spending category is {top_cat} — consider reducing that first."
+        elif budget_val:
+            return f"You're within your budget. Spent ₹{total_spent:,} of ₹{budget_val:,}."
+        else:
+            return "No budget set — open the Budget Planner and save a monthly budget so I can compare."
+
+    if any(k in txt for k in ["where money", "category", "which category", "spend most"]):
+        if not cat_totals:
+            return "No expense data found yet."
+        return f"You're spending most on {top_cat} (₹{int(cat_totals.get(top_cat,0)):,})."
+
+    if any(k in txt for k in ["plan", "next month", "create plan", "detailed plan"]):
+        session["agora_pending"] = "confirm_create_plan"
+        return "I can create a month-by-month savings plan with category cuts to meet your savings goal. Should I create it now? (yes/no)"
+
+    if any(k in txt for k in ["tips", "suggest", "advice", "help me save", "how to save"]):
+        tips = []
+        if top_cat:
+            tips.append(f"Reduce {top_cat} by 10% — small percentage changes compound.")
+        tips.append("Automate transfers to savings as soon as you receive income.")
+        tips.append("Review subscriptions and recurring payments; cancel unused subscriptions.")
+        return "\n".join(tips)
+
+    return "I can help with: analysis, savings targets, overspending alerts, creating a plan. Try: 'Analyze my spending' or 'Create plan'."
+
+# ----------------------------
+# PAGES
+# ----------------------------
+
+# ----------------------------
+# PAGE: Home
+# ----------------------------
+if page == "Home":
+    st.title("BudgetHelp")
+    st.subheader("Your Personal Finance Companion")
+
+    df = st.session_state.get("expenses_df", pd.DataFrame(columns=["amount","category","note","timestamp"]))
+    income = st.session_state.get("income", 0)
+    budget = st.session_state.get("budget", 0)
+
+    total_spent = int(df["amount"].sum()) if not df.empty else 0
+    remaining = int(budget - total_spent) if budget else 0
+
+    st.write("### Quick Overview")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Income", f"₹{income:,}")
+    c2.metric("Spent", f"₹{total_spent:,}")
+    c3.metric("Remaining", f"₹{remaining:,}")
+
+    st.write("---")
+    st.subheader("Recent Expenses")
+    if df.empty:
+        st.info("No expenses yet.")
+    else:
+        st.table(df.tail(5).iloc[::-1])
+
+    st.write("---")
+    st.subheader("Quick Actions")
+    col1, col2, col3 = st.columns(3)
+    if col1.button("➕ Add Expense"):
+        st.experimental_set_query_params(_page="Budget Planner")
+        # just navigate by instructing the user
+    if col2.button("📊 View Analytics"):
+        st.experimental_set_query_params(_page="Analytics Dashboard")
+    if col3.button("🤖 Ask AI Assistant"):
+        st.experimental_set_query_params(_page="Chat Assistant")
+
+    st.write("---")
+    st.image("https://c8.alamy.com/comp/WJ4338/dollar-money-on-hand-icon-vector-vector-WJ4338.jpg", use_container_width=True)
+
+# ----------------------------
+# PAGE: Budget Planner
+# ----------------------------
+elif page == "Budget Planner":
+    st.title("Budget Planner")
+    st.subheader("Plan Your Monthly Budget")
+
+    income_val = st.number_input("Monthly Income (₹)", min_value=0, value=int(st.session_state.get("income",0)))
+    food = st.number_input("Food (₹)", min_value=0, value=0)
+    transport = st.number_input("Transport (₹)", min_value=0, value=0)
+    entertainment = st.number_input("Entertainment (₹)", min_value=0, value=0)
+    bills = st.number_input("Bills (₹)", min_value=0, value=0)
+    savings_goal = st.slider("Savings Goal (%)", 0, 50, int(st.session_state.get("savings_goal",20)))
+
+    if st.button("Save Budget"):
+        total_planned = food + transport + entertainment + bills
+        st.session_state.income = int(income_val)
+        st.session_state.budget = int(total_planned)
+        st.session_state.savings_goal = int(savings_goal)
+        st.session_state.category_budgets = {"Food":food,"Transport":transport,"Entertainment":entertainment,"Bills":bills}
+        save_settings({"income":st.session_state.income,"budget":st.session_state.budget,"savings_goal":st.session_state.savings_goal})
+        st.success("Budget saved!")
+
+    st.write("---")
+    # DAILY EXPENSE INPUT (WITH ML PREDICTION)
+    st.subheader("Add Daily Expense")
+
+    expense_amount = st.number_input("Amount (₹)", min_value=1, key="exp_amt")
+    expense_note = st.text_input("Note (optional)", placeholder="e.g., dinner, uber, electricity bill")
+
+    st.write('#### Quick bulk add (optional)')
+    st.info('Format: category1:amount1, category2:amount2  — example: Food:200, Transport:150')
+    bulk_input = st.text_input('Bulk add (optional)', placeholder='e.g., Food:200, Transport:150', key='bulk_input')
+
+    # ML-predicted category
+    if expense_note and expense_note.strip() != "":
+        try:
+            predicted_category = predict_expense_category(expense_note)
+            st.info(f"AI-Predicted Category: {predicted_category}")
+        except Exception:
+            predicted_category = "Other"
+    else:
+        predicted_category = "Other"
+
+    categories = ["Food", "Transport", "Entertainment", "Bills", "Shopping", "Other"]
+    selected_index = categories.index(predicted_category) if predicted_category in categories else len(categories)-1
+    expense_category = st.selectbox("Select / Confirm Category", categories, index=selected_index)
+
+    if st.button("Add Expense"):
+        # If bulk input provided, parse and add multiple expenses
+        df = st.session_state.get("expenses_df", pd.DataFrame(columns=["amount","category","note","timestamp"]))
+        if 'bulk_input' in locals() and bulk_input and bulk_input.strip() != "":
+            parts = [p.strip() for p in bulk_input.split(",") if ":" in p]
+            added = 0
+            for p in parts:
+                try:
+                    cat, amt = p.split(":")
+                    amt = float(amt.strip())
+                    cat = cat.strip().title()
+                    new_e = {"amount": amt, "category": cat, "note": "bulk", "timestamp": pd.Timestamp.now()}
+                    df = pd.concat([df, pd.DataFrame([new_e])], ignore_index=True)
+                    added += 1
+                except Exception:
+                    continue
+            st.session_state.expenses_df = df
+            save_expenses(df)
+            st.success(f"Added {added} expenses from bulk input.")
+        else:
+            new_exp = {
+                "amount": float(expense_amount),
+                "category": expense_category,
+                "note": expense_note,
+                "timestamp": pd.Timestamp.now()
+            }
+            df = st.session_state.get("expenses_df", pd.DataFrame(columns=["amount","category","note","timestamp"]))
+            df = pd.concat([df, pd.DataFrame([new_exp])], ignore_index=True)
+            st.session_state.expenses_df = df
+            save_expenses(df)
+            st.success("Expense added & saved!")
+
+        # --- Budget check & audible alert ---
+        try:
+            total_spent = float(st.session_state.expenses_df["amount"].sum())
+            monthly_budget = st.session_state.get("budget", 0)
+            if monthly_budget and total_spent > monthly_budget:
+                st.warning(f"⚠ You are over your monthly budget! Spent ₹{int(total_spent):,} of ₹{int(monthly_budget):,}.")
+                import numpy as _np, io as _io, wave as _wave
+                freq = 440.0
+                duration = 0.25
+                samplerate = 44100
+                t = _np.linspace(0, duration, int(samplerate*duration), False)
+                note = 0.5*_np.sin(freq * t * 2 * _np.pi)
+                audio = (note * 32767).astype(_np.int16)
+                buf = _io.BytesIO()
+                with _wave.open(buf, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(samplerate)
+                    wf.writeframes(audio.tobytes())
+                buf.seek(0)
+                st.audio(buf.read(), format='audio/wav')
+        except Exception:
+            pass
+
+    st.write("---")
+    st.subheader("Recent")
+    df = st.session_state.get("expenses_df", pd.DataFrame(columns=["amount","category","note","timestamp"]))
+    if not df.empty:
+        st.table(df.tail(8).iloc[::-1])
+
+# ----------------------------
+# PAGE: Analytics Dashboard
+# ----------------------------
+elif page == "Analytics Dashboard":
+    st.title("Analytics Dashboard")
+    df = st.session_state.get("expenses_df", pd.DataFrame(columns=["amount","category","note","timestamp"]))
+    budget = st.session_state.get("budget", 0)
+    income = st.session_state.get("income", 0)
+
+    if df.empty:
+        st.info("No expenses recorded yet.")
+    else:
+        # Ensure timestamp is datetime
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        st.subheader("Monthly Spending Progress")
+        total_spent = int(df["amount"].sum())
+        progress = (total_spent / budget) if budget else 0
+        st.progress(min(progress, 1))
+        st.write(f"Spent ₹{total_spent:,} out of ₹{budget:,}")
+
+        st.subheader("Category Breakdown")
+        cat_sum = df.groupby("category")["amount"].sum().sort_values(ascending=False)
+        st.bar_chart(cat_sum)
+
+        # Monthly totals (group by year-month)
+        st.subheader("Monthly Spending (by month)")
+        df["month"] = df["timestamp"].dt.to_period("M").dt.to_timestamp()
+        monthly = df.groupby("month")["amount"].sum().sort_index()
+        if not monthly.empty:
+            st.bar_chart(monthly)
+
+            fig_m, ax_m = plt.subplots(figsize=(8,3))
+            ax_m.bar(monthly.index.astype(str), monthly.values)
+            ax_m.set_title("Total spent per month")
+            ax_m.set_xticklabels(monthly.index.astype(str), rotation=45, ha="right")
+            ax_m.set_ylabel("Amount (₹)")
+            plt.tight_layout()
+            st.pyplot(fig_m)
+
+        # Category pie chart
+        st.subheader("Category Share")
+        try:
+            pie_vals = cat_sum.values
+            pie_labels = cat_sum.index.tolist()
+            fig_p, ax_p = plt.subplots(figsize=(5,5))
+            ax_p.pie(pie_vals, labels=pie_labels, autopct="%1.1f%%", startangle=140)
+            ax_p.axis("equal")
+            st.pyplot(fig_p)
+        except Exception:
+            pass
+
+        # Daily trend + forecast
+        st.subheader("Daily Spending Trend + 30-day Forecast")
+        df_daily = df.set_index("timestamp").resample("D")["amount"].sum().fillna(0)
+        daily = df_daily.copy()
+        st.line_chart(daily.tail(60))
+
+        # Forecast (try prophet -> arima -> simple fallback)
+        try:
+            forecast_series = fit_prophet_and_forecast(daily.index, daily.values, periods=30)
+            method_used = "Prophet"
+        except Exception:
+            try:
+                forecast_series = fit_arima_and_forecast(daily.index, daily.values, periods=30)
+                method_used = "ARIMA (pmdarima/statsmodels)"
+            except Exception:
+                forecast_series = fit_arima_and_forecast(daily.index, daily.values, periods=30)
+                method_used = "Simple fallback"
+
+        # Show plot: actuals + forecast
+        idx_comb = daily.index.union(forecast_series.index)
+        # Plot last 60 actuals and next 30 forecast
+        fig, ax = plt.subplots(figsize=(10,4))
+        if len(daily) > 0:
+            ax.plot(daily.index[-60:], daily.values[-60:], label="Actual (last 60 days)")
+        # plot forecast tail (next 30)
+        try:
+            fc_tail_idx = forecast_series.index[-30:]
+            fc_tail_vals = forecast_series.values[-30:]
+            ax.plot(fc_tail_idx, fc_tail_vals, linestyle="--", label=f"Forecast (next 30 days) — {method_used}")
+        except Exception:
+            pass
+        ax.set_ylabel("Daily spend (₹)")
+        ax.legend()
+        st.pyplot(fig)
+
+        avg_forecast_next30 = float(forecast_series[-30:].mean()) if len(forecast_series) >= 30 else float(forecast_series.mean())
+        proj_next30 = avg_forecast_next30 * 30
+        st.write(f"Projected spending next 30 days (approx): ₹{int(proj_next30):,} (method: {method_used})")
+        monthly_budget = st.session_state.get("budget", 0)
+        if monthly_budget and proj_next30 > monthly_budget:
+            st.warning("Forecast projection indicates you may exceed your planned monthly budget. Consider reducing top categories.")
+            # optional softer alert tone
+            try:
+                freq = 660.0
+                duration = 0.18
+                samplerate = 44100
+                t = np.linspace(0, duration, int(samplerate*duration), False)
+                note = 0.4*np.sin(freq * t * 2 * np.pi)
+                audio = (note * 32767).astype(np.int16)
+                buf = io.BytesIO()
+                with wave.open(buf, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(samplerate)
+                    wf.writeframes(audio.tobytes())
+                buf.seek(0)
+                st.audio(buf.read(), format='audio/wav')
+            except Exception:
+                pass
+        else:
+            st.success("Forecast indicates you are likely within planned budget range.")
+
+# ----------------------------
+# PAGE: Chat Assistant (Advanced)
+# ----------------------------
+elif page == "Chat Assistant":
+    st.title("Chat Assistant")
+    st.subheader("Agora Conversational AI – Your Finance Coach")
+
+    if "agora_chat" not in st.session_state:
+        st.session_state.agora_chat = []  # list of (role, text)
+    if "agora_pending" not in st.session_state:
+        st.session_state.agora_pending = None
+
+    # show chat history
+    if st.session_state.agora_chat:
+        for role, text in st.session_state.agora_chat[-40:]:
+            if role == "user":
+                st.markdown(f"You: {text}")
+            else:
+                st.markdown(f"Agora: {text}")
+
+    import streamlit.components.v1 as components
+st.write("### Voice Input (beta)")
+
+APP_ID = "b3fe6690a5be44efb4b9d6f5c1dbfb3e"
+CHANNEL = "hackathonChannel"
+TOKEN = "007eJxTYLja5lZzZX/d5dv5hVMDuYt/yD41+T61W+m5UuGWBIa4LicFhiTjtFQzM0uDRNOkVBOT1LQkkyTLFLM002TDlKS0JONUy8PimQ2BjAxnH95iYIRCEF+AISMxOTuxJCM/zzkjMS8vNYeBAQCSISaL"
+
+html_template = """
+<div>
+    <button id="start">Start Mic</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="copy" disabled>Copy</button>
+    <p id="status">Status: idle</p>
+    <textarea id="transcript" style="width:100%;height:80px;"></textarea>
+</div>
+
+<script src="https://download.agora.io/sdk/release/AgoraRTC_N.js"></script>
+<script src="https://download.agora.io/sdk/release/AgoraRTCAI_STT.js"></script>
+
+<script>
+const startBtn = document.getElementById("start");
+const stopBtn = document.getElementById("stop");
+const copyBtn = document.getElementById("copy");
+const status = document.getElementById("status");
+const transcriptEl = document.getElementById("transcript");
+
+let client = null;
+let localAudioTrack = null;
+let stt = null;
+
+startBtn.onclick = async () => {
+    startBtn.disabled = true;
+    status.innerText = "Status: connecting...";
+
+    client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+    await client.join("{{APP_ID}}", "{{CHANNEL}}", "{{TOKEN}}", null);
+
+    localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
+    await client.publish([localAudioTrack]);
+
+    stt = await AgoraRTC.createRealtimeTranscription({
+        audioTrack: localAudioTrack,
+        language: "en-US",
+        interval: 400
+    });
+
+    stt.on("transcription", (data) => {
+        transcriptEl.value = data.text;
+    });
+
+    await stt.start();
+    status.innerText = "Status: listening...";
+    stopBtn.disabled = false;
+    copyBtn.disabled = true;
+};
+
+stopBtn.onclick = async () => {
+    if (stt) { await stt.stop(); stt = null; }
+    if (localAudioTrack) { localAudioTrack.stop(); localAudioTrack.close(); localAudioTrack = null; }
+    if (client) { await client.leave(); client = null; }
+
+    status.innerText = "Status: stopped";
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+    copyBtn.disabled = false;
+};
+
+copyBtn.onclick = () => {
+    navigator.clipboard.writeText(transcriptEl.value)
+    .then(() => alert("Copied. Paste the text into the chat box."));
+};
+</script>
+"""
+
+html_string = (
+    html_template
+    .replace("{{APP_ID}}", APP_ID)
+    .replace("{{CHANNEL}}", CHANNEL)
+    .replace("{{TOKEN}}", TOKEN)
+)
+
+components.html(html_string, height=260)
+st.caption("After recording, press Copy and paste the text into chat box below.")# ----------------------------
+# PAGE: Profile & Settings
+# ----------------------------
+elif page == "Profile & Settings":
+    st.title("Profile & Settings")
+    st.write("Manage your settings and demo tools.")
+
+    st.write("---")
+    st.subheader("Profile")
+    st.write("Income:", st.session_state.get("income", 0))
+    st.write("Budget:", st.session_state.get("budget", 0))
+    st.write("Savings goal (%):", st.session_state.get("savings_goal", 20))
+
+    st.write("---")
+    st.subheader("Actions")
+    if st.button("Clear all expenses"):
+        st.session_state.expenses_df = pd.DataFrame(columns=["amount","category","note","timestamp"])
+        if os.path.exists(DATA_FILE):
+            os.remove(DATA_FILE)
+        st.success("Expenses cleared.")
+    if st.button("Load demo data (60 days)"):
+        # generate simple demo data: daily random small expenses across categories
+        rng = pd.date_range(end=pd.Timestamp.now(), periods=60, freq="D")
+        cats = ["Food","Transport","Entertainment","Bills","Shopping"]
+        demo = []
+        for d in rng:
+            # create 1-3 expenses per day
+            for _ in range(np.random.randint(1,3)):
+                demo.append({
+                    "amount": float(np.random.randint(100, 3000)),
+                    "category": np.random.choice(cats, p=[0.4,0.2,0.1,0.2,0.1]),
+                    "note": "demo",
+                    "timestamp": d
+                })
+        df_demo = pd.DataFrame(demo)
+        st.session_state.expenses_df = df_demo
+        save_expenses(df_demo)
+        st.success("Demo data loaded (60 days).")
+
+    st.write("---")
+    st.subheader("Export")
+    df_export = st.session_state.get("expenses_df", pd.DataFrame(columns=["amount","category","note","timestamp"]))
+    if not df_export.empty:
+        csv = df_export.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", data=csv, file_name="expenses.csv", mime="text/csv")
